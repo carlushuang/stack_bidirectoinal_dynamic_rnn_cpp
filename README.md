@@ -10,5 +10,6 @@ this will dump the input/output/state/weight into blob/*.npy
 in "cpp" folder, run "build.sh", and run ./dynamic_rnn <path/to/py/blob>
 you will see a lot output, and can check the result
 
+** use https://github.com/rogersce/cnpy to read/write numpy ndarray
 ** tested all under ubuntu environment
 
