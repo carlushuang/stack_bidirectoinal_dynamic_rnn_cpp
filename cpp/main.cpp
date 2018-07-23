@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string>
 #include <string.h>
+#include <stdio.h>
 
 static inline float sigmoid(float number) { return 1. / (1. + exp(-number)); }
 static inline float tanh(float x){return (exp(2*x)-1)/(exp(2*x)+1);}
@@ -77,12 +78,12 @@ int basic_lstm_cell(float * input, float * init_state, float * kernel, float * b
     return 0;
 }
 
-int NUM_LAYERS  = 5;
-int STEP_LENGTH = 3;
-int HIDDEN_SIZE = 5;
-int INPUT_SIZE  = 8;
+int NUM_LAYERS  = 2;
+int STEP_LENGTH = 18;
+int HIDDEN_SIZE = 256;
+int INPUT_SIZE  = 3072;
 int BATCH_SIZE = 1;
-float FORGET_BIAS = 1.0;
+float FORGET_BIAS = 0.0;
 
 static void dump_npy_array_info(const cnpy::NpyArray & arr, const std::string & m){
     std::cout<<m;
@@ -95,7 +96,7 @@ static void dump_npy_array_info(const cnpy::NpyArray & arr, const std::string & 
 
 typedef struct _rnn_type{
 
-    int m_num_layers;
+    int m_num_layer;
     int m_seq_length;
     int m_input_size;
     int m_num_units;        // hidden size
@@ -137,7 +138,7 @@ int stack_bidirectional_dynamic_rnn(rnn_type * rnn, float * input, float * outpu
         tmp_out_bw = new float [rnn->m_seq_length * rnn->m_num_units];
     float * ptr_w_fw = rnn->ptr_weight_fw;
     float * ptr_w_bw = rnn->ptr_weight_bw;
-    for(j=0;j<rnn->m_num_layers;j++){
+    for(j=0;j<rnn->m_num_layer;j++){
         //if (j==1)
         //    break;
         int cur_kernel_num = 4*rnn->m_num_units * (input_size+rnn->m_num_units)/*kernel*/ ;
@@ -202,10 +203,7 @@ int stack_bidirectional_dynamic_rnn(rnn_type * rnn, float * input, float * outpu
         // weight size may differenct in the 1st layer, so we have to do accumulate
         ptr_w_fw += cur_weight_num;
         ptr_w_bw += cur_weight_num;
-        std::cout<<"__ out:";
-        for(int ii=0;ii<out_size;ii++)
-            std::cout<<output[ii]<<", ";
-        std::cout<<std::endl;
+
     }
     delete [] tmp_out_fw;
     if(tmp_out_bw)
@@ -227,7 +225,7 @@ int cal_rnn_num_weights(int num_layers, int num_hidden, int num_input, bool bi){
 int init_dynamic_rnn(rnn_type * rnn, int layers, int seq_len, int inputs, int hidden_size, bool bi,float forget_bias,
         float * init_st_fw, float * init_st_bw, float *w_fw, float * w_bw)
 {
-    rnn->m_num_layers = layers;
+    rnn->m_num_layer = layers;
     rnn->m_seq_length = seq_len;
     rnn->m_input_size = inputs;
     rnn->m_num_units = hidden_size;
@@ -240,34 +238,6 @@ int init_dynamic_rnn(rnn_type * rnn, int layers, int seq_len, int inputs, int hi
 
     rnn->ptr_weight_fw = new float[num_weights];
     rnn->ptr_state_fw  = new float[num_state];
-
-#if 0
-    std::cout<<"weight fw:"<<std::endl;
-    for(int i=0;i<num_weights;i++){
-        std::cout<<w_fw[i]<<", ";
-    }
-    
-    std::cout<<std::endl;
-    std::cout<<"weight bw:"<<std::endl;
-    for(int i=0;i<num_weights;i++){
-        std::cout<<w_bw[i]<<", ";
-    }
-    std::cout<<std::endl;
-    std::cout<<"init fw:"<<std::endl;
-    for(int j=0;j<layers;j++){
-        for(int i=0;i<2*hidden_size;i++){
-            std::cout<<init_st_fw[j*2*hidden_size + i]<<", ";
-        }
-        std::cout<<std::endl;
-    }
-    std::cout<<"init bw:"<<std::endl;
-    for(int j=0;j<layers;j++){
-        for(int i=0;i<2*hidden_size;i++){
-            std::cout<<init_st_bw[j*2*hidden_size + i]<<", ";
-        }
-        std::cout<<std::endl;
-    }
-#endif
 
     if(w_fw)
         memcpy(rnn->ptr_weight_fw, w_fw, num_weights*sizeof(float));
@@ -288,6 +258,8 @@ int init_dynamic_rnn(rnn_type * rnn, int layers, int seq_len, int inputs, int hi
         rnn->ptr_weight_bw = nullptr;
         rnn->ptr_state_bw = nullptr;
     }
+
+    return 0;
 }
 int destroy_dynamic_rnn(rnn_type * rnn){
     delete [] rnn->ptr_weight_fw;
@@ -298,10 +270,229 @@ int destroy_dynamic_rnn(rnn_type * rnn){
     }
 }
 
+// note: this only support bi directional!
+/*
+     tf_canonicals: a list of tensors of tf canonical params. The elements are
+        laid out in the following format:
+        ------------------------------------------------------------
+        | weights                    | biases                      |
+        ------------------------------------------------------------
+        \                             \
+         \                             \
+          -------------------------------
+          | layer1     |layer2     |... |
+          -------------------------------
+          \             \
+           ---------------
+           |fwd   |bak   |
+
+        |  weight fw/bw
+        -------------------------------
+        | layer1     | layer2    |...    |
+        -------------------------------
+        |    w|b     |   w|b     |...
+*/
+static void cudnn_params_to_canonical(float * param, int num_layers, int input_size, int hidden_size, float * w_fw, float * w_bw){
+    // Cudnn LSTM weights are in ifco order, other tf LSTMs are in icfo order.
+    int l;
+    float * cudnn_w;
+    float * cudnn_bias;
+    cudnn_w = param;
+    int cudnn_w_num = cal_rnn_num_weights(num_layers,hidden_size, input_size, true);
+    cudnn_w_num *= 2;       // bidirect
+    cudnn_bias = param + cudnn_w_num;
+    int in_size = input_size;
+    float * tmp_bias = new float[4*hidden_size];
+    int total_w_fw=0;
+    int total_w_bw=0;
+    int total_b_fw=0;
+    int total_b_bw=0;
+    for(l=0;l<num_layers;l++){
+        in_size = (l==0) ? input_size:(2*hidden_size);
+        int cur_bias_num = 4*hidden_size /*bias*/;
+        // forward
+        for(int in=0;in<in_size;in++){
+            int cw_1_width = in_size;
+            int cw_1_height = hidden_size;
+            int can_1_width = 4*hidden_size;
+            int can_1_height = in_size;
+
+            // i
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[ in*can_1_width + hidden_size*0 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*0+  hi*cw_1_width+in ];
+            }
+            // c
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[ in*can_1_width + hidden_size*1 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*2 + hi*cw_1_width+in ];
+            }
+            // f
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[ in*can_1_width + hidden_size*2 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*1 + hi*cw_1_width+in ];
+            }
+            // o
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[ in*can_1_width + hidden_size*3 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*3 + hi*cw_1_width+in ];
+            }
+        }
+        w_fw += 4*hidden_size*in_size;
+        cudnn_w += 4*hidden_size*in_size;
+        total_w_fw += 4*hidden_size*in_size;
+        for(int in=0;in<hidden_size;in++){
+            int cw_1_width = hidden_size;
+            int cw_1_height = hidden_size;
+            int can_1_width = 4*hidden_size;
+            int can_1_height = hidden_size;
+            // i
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[in*can_1_width + hidden_size*0 + hi  ] = cudnn_w[ cw_1_width*cw_1_height*0+  hi*cw_1_width+in ];
+            }
+            // c
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[in*can_1_width + hidden_size*1 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*2 + hi*cw_1_width+in ];
+            }
+            // f
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[in*can_1_width + hidden_size*2 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*1 + hi*cw_1_width+in ];
+            }
+            // o
+            for(int hi=0;hi<hidden_size;hi++){
+                w_fw[in*can_1_width + hidden_size*3 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*3 + hi*cw_1_width+in ];
+            }
+        }
+        w_fw += 4*hidden_size*hidden_size;
+        cudnn_w += 4*hidden_size*hidden_size;
+        total_w_fw += 4*hidden_size*hidden_size;
+
+        // merge cudnn bias to canonical bias
+        for(int j=0;j<cur_bias_num;j++){
+            tmp_bias[j] = cudnn_bias[j] + cudnn_bias[j + cur_bias_num];
+        }
+        for(int j=0;j<hidden_size;j++){
+            //ifco->icfo
+            float tmp = tmp_bias[1*hidden_size +j];
+            tmp_bias[1*hidden_size +j] = tmp_bias[2*hidden_size +j];
+            tmp_bias[2*hidden_size +j] = tmp;
+        }
+        memcpy(w_fw, tmp_bias, sizeof(float)*cur_bias_num);
+        w_fw += cur_bias_num;
+        cudnn_bias += 2*cur_bias_num;       // merge
+        total_b_fw += 2*cur_bias_num;
+
+        // backward
+        for(int in=0;in<in_size;in++){
+            int cw_1_width = in_size;
+            int cw_1_height = hidden_size;
+            int can_1_width = 4*hidden_size;
+            int can_1_height = in_size;
+
+            // i
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[ in*can_1_width + hidden_size*0 + hi  ] = cudnn_w[ cw_1_width*cw_1_height*0+  hi*cw_1_width+in ];
+            }
+            // c
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[ in*can_1_width + hidden_size*1 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*2 + hi*cw_1_width+in ];
+            }
+            // f
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[ in*can_1_width + hidden_size*2 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*1 + hi*cw_1_width+in ];
+            }
+            // o
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[ in*can_1_width + hidden_size*3 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*3 + hi*cw_1_width+in ];
+            }
+        }
+        w_bw += 4*hidden_size*in_size;
+        cudnn_w += 4*hidden_size*in_size;
+        total_w_bw += 4*hidden_size*in_size;
+
+        for(int in=0;in<hidden_size;in++){
+            int cw_1_width = hidden_size;
+            int cw_1_height = hidden_size;
+            int can_1_width = 4*hidden_size;
+            int can_1_height = hidden_size;
+            // i
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[in*can_1_width + hidden_size*0 + hi  ] = cudnn_w[ cw_1_width*cw_1_height*0+  hi*cw_1_width+in ];
+            }
+            // c
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[in*can_1_width + hidden_size*1 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*2 + hi*cw_1_width+in ];
+            }
+            // f
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[in*can_1_width + hidden_size*2 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*1 + hi*cw_1_width+in ];
+            }
+            // o
+            for(int hi=0;hi<hidden_size;hi++){
+                w_bw[in*can_1_width + hidden_size*3 + hi  ] = cudnn_w[  cw_1_width*cw_1_height*3 + hi*cw_1_width+in ];
+            }
+        }
+        w_bw += 4*hidden_size*hidden_size;
+        cudnn_w += 4*hidden_size*hidden_size;
+        total_w_bw += 4*hidden_size*hidden_size;
+
+        // merge cudnn bias to canonical bias
+        for(int j=0;j<cur_bias_num;j++){
+            tmp_bias[j] = cudnn_bias[j] + cudnn_bias[j + cur_bias_num];
+        }
+
+        for(int j=0;j<hidden_size;j++){
+            //ifco->icfo
+            float tmp = tmp_bias[1*hidden_size +j];
+            tmp_bias[1*hidden_size +j] = tmp_bias[2*hidden_size +j];
+            tmp_bias[2*hidden_size +j] = tmp;
+        }
+
+        memcpy(w_bw, tmp_bias, sizeof(float)*cur_bias_num);
+
+        w_bw += cur_bias_num;
+        cudnn_bias += 2*cur_bias_num;       // merge
+        total_b_bw += 2*cur_bias_num;
+    }
+
+    //printf("total_w_fw:%d, total_w_bw:%d, total_b_fw:%d, total_b_bw:%d\n", total_w_fw, total_w_bw, total_b_fw,  total_b_bw);
+    delete [] tmp_bias;
+}
+
+static inline void read_rpd_io(float * ptr, int num, const char * file_name){
+    FILE * fp = fopen(file_name, "r");
+    if(!fp){
+        std::cout<<"error open "<<file_name<<std::endl;
+        return;
+    }
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read;
+    int idx = 0;
+
+    while ( (read = getline(&line, &len, fp)) != -1   ) {
+        //printf("Retrieved line of length %u :\n", read);
+        //printf("%s", line);
+        std::string _s(line);
+        ptr[idx] = std::stof (_s);
+        idx++;
+        if(idx >= num)
+            break;
+    }
+    std::cout<<"read "<<idx<<" floats from file:"<<file_name<<std::endl;
+    free(line);
+    fclose(fp);
+}
+
+static void dump_float_array(const char * file_name, float * ptr, int num){
+    FILE * fp;
+    fp = fopen(file_name, "w");
+    for(int ss = 0;ss <num;ss++)
+        fprintf(fp, "%f\n", ptr[ss]);
+    fclose(fp);
+}
 
 int main(int argc, char ** argv){
+#if 0
     if(argc<2)
         return -1;
+
     std::string blob_path = argv[1];
     cnpy::NpyArray arr_init_state_fw = cnpy::npy_load(blob_path+"/init_state_fw.npy");
     cnpy::NpyArray arr_init_state_bw = cnpy::npy_load(blob_path+"/init_state_bw.npy");
@@ -333,6 +524,59 @@ int main(int argc, char ** argv){
     float * init_state_bw = arr_init_state_bw.data<float>();
     float * weight_fw = arr_weight_fw.data<float>();
     float * weight_bw = arr_weight_bw.data<float>();
+#endif
+    float * output = nullptr;
+    float * out_state_fw  = nullptr;
+    float * out_state_bw  = nullptr;
+    float * output_0    = nullptr;
+    float * out_state_fw_0 = nullptr;
+    float * out_state_bw_0 = nullptr;
+
+    float * input = nullptr;
+    float * init_state_fw = nullptr;
+    float * init_state_bw = nullptr;
+    float * weight_fw = nullptr;
+    float * weight_bw = nullptr;
+
+    {
+        // 1-input
+        input = new float[STEP_LENGTH * INPUT_SIZE];
+        // init from rpd net
+        read_rpd_io(input, STEP_LENGTH * INPUT_SIZE, "0149.00_rpn_in_shadow-LSTMLayers-CudnnRNN_shadow-LSTMLayers-transpose_0_n1_c3072_h18_w1");
+        //dump_float_array("dump_lstm_input_0.txt", input, STEP_LENGTH * INPUT_SIZE);
+
+        // 2-weight
+        int _num_weights = cal_rnn_num_weights(NUM_LAYERS,HIDDEN_SIZE, INPUT_SIZE, true);
+        _num_weights += NUM_LAYERS * 4*HIDDEN_SIZE *2;  // cudnn need 2x bias!!!
+        _num_weights = 2*_num_weights;      // bidirection
+        float * tmp_w = new float[_num_weights];
+        read_rpd_io(tmp_w, _num_weights, "0149.03_rpn_in_shadow-LSTMLayers-CudnnRNN_shadow-LSTMLayers-cudnn_w_n1_c8396800_h1_w1");
+        //dump_float_array("dump_lstm_input_w.txt", tmp_w, _num_weights);
+        int _num_w_canonical = cal_rnn_num_weights(NUM_LAYERS,HIDDEN_SIZE, INPUT_SIZE, true);
+        _num_w_canonical += NUM_LAYERS * 4*HIDDEN_SIZE;
+        weight_fw = new float [_num_w_canonical];
+        weight_bw = new float [_num_w_canonical];
+        cudnn_params_to_canonical(tmp_w, NUM_LAYERS, INPUT_SIZE, HIDDEN_SIZE, weight_fw, weight_bw);
+        delete [] tmp_w;
+        // 3-output
+        output_0 = new float [STEP_LENGTH * 2 * HIDDEN_SIZE];
+        read_rpd_io(output_0, STEP_LENGTH * 2 * HIDDEN_SIZE, "0150.00_rpn_in_shadow-LSTMLayers-Reshape_5_shadow-LSTMLayers-CudnnRNN_n1_c1_h18_w512");
+        output = new float [STEP_LENGTH * 2 * HIDDEN_SIZE];
+
+        // others
+        init_state_fw = new float [NUM_LAYERS * 2 * HIDDEN_SIZE];
+        for(int _i = 0;_i<NUM_LAYERS * 2 * HIDDEN_SIZE;_i++){
+            init_state_fw[_i] = 0;
+        }
+        init_state_bw = new float [NUM_LAYERS * 2 * HIDDEN_SIZE];
+        for(int _i = 0;_i<NUM_LAYERS * 2 * HIDDEN_SIZE;_i++){
+            init_state_bw[_i] = 0;
+        }
+        out_state_fw  = new float[NUM_LAYERS*2*HIDDEN_SIZE];
+        out_state_bw  = new float[NUM_LAYERS*2*HIDDEN_SIZE];
+        //out_state_fw_0 = new float[NUM_LAYERS*2*HIDDEN_SIZE];
+        //out_state_bw_0 = new float[NUM_LAYERS*2*HIDDEN_SIZE];
+    }
 
     rnn_type rnn;
     init_dynamic_rnn(&rnn, NUM_LAYERS, STEP_LENGTH, INPUT_SIZE, HIDDEN_SIZE, true, FORGET_BIAS,
@@ -341,7 +585,11 @@ int main(int argc, char ** argv){
     stack_bidirectional_dynamic_rnn(&rnn, input, output, out_state_fw, out_state_bw);
 
     destroy_dynamic_rnn(&rnn);
-
+    {
+        // dump output
+        dump_float_array("dump_lstm_output.txt", output,STEP_LENGTH * 2 * HIDDEN_SIZE);
+    }
+#if 0
     std::cout<<"------ origin out_stat fw (layers, 2*hidden_size)"<<std::endl;
     for(int j=0;j<NUM_LAYERS;j++){
         for(int i=0;i<2*HIDDEN_SIZE;i++){
@@ -387,7 +635,7 @@ int main(int argc, char ** argv){
         std::cout<<std::endl;
     }
     std::cout<<std::endl;
-
+#endif
     delete [] output;
     delete [] out_state_fw;
     delete [] out_state_bw;
